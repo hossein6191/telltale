@@ -135,7 +135,7 @@ class TestTask:
     def test_the_judge_is_warned_about_letters_and_titles(self):
         task = tt._task("r", A, B)
         assert "names a letter" in task
-        assert "repeats a title" in task
+        assert "own words back, whether its title or its body" in task
         assert "UNTRUSTED" in task
 
     def test_every_pick_is_offered(self):
@@ -154,8 +154,12 @@ class TestReadPick:
         with pytest.raises(tt.gl.vm.UserError):
             tt._read_pick("a")
 
-    def test_a_reason_is_capped(self):
-        assert len(tt._read_pick({"pick": "a", "reason": "x" * 999})[1]) == tt.MAX_REASON_CHARS
+    def test_the_judge_is_never_asked_for_prose(self):
+        """No sentence crosses consensus, so no node's words are stored as everybody's."""
+        assert tt._read_pick({"pick": "a"}) == "a"
+        assert "reason" not in tt._task("r", A, B)
+        assert tt._why(tt.SPECIFIC, ["x", "y"]) == "told apart from x and y, both ways round"
+        assert "disagreed" in tt._why(tt.UNCLEAR, ["x"])
 
 
 class TestOutcome:
@@ -212,14 +216,14 @@ def _as(sender, now="2026-09-16T00:00:00Z"):
 
 def _contract(sender="0xOWNER", vocabulary=None):
     c = tt.Telltale.__new__(tt.Telltale)
-    c.subjects = {}; c.subject_ids = []; c.responses = {}; c.response_ids = []
+    c.subjects = {}; c.subject_ids = []; c.responses = {}; c.response_ids = []; c.tried = {}
     c.vocabulary_json = json.dumps(sorted(vocabulary or VOCAB))
     _as(sender)
     return c
 
 
-def _judging(contract, outcome, reason="because"):
-    contract._discriminate = lambda text, real, decoy: (outcome, reason)
+def _judging(contract, outcome):
+    contract._discriminate = lambda text, real, decoys: outcome
 
 
 class TestVocabulary:
@@ -291,7 +295,8 @@ class TestResponses:
         _as("0xWRITER")
         out = json.loads(c.respond("r1", "refunds", "The 30 day window contradicts the 45 day rule."))
         assert out["status"] == tt.UNTESTED
-        assert json.loads(c.response("r1"))["author"] == "0xWRITER"
+        row = json.loads(c.response("r1"))
+        assert row["author"] == "0xWRITER" and row["tested"] is False
         assert c.is_specific("r1") is False        # untested is never paid
 
     def test_a_response_needs_a_subject_that_exists(self):
@@ -306,83 +311,151 @@ class TestResponses:
             c.respond("r1", "refunds", "x" * (tt.MAX_RESPONSE_CHARS + 1))
 
 
-class TestDecoy:
-    def test_the_decoy_is_the_nearest_neighbour_not_any_other_subject(self):
-        c = _contract()
+class TestField:
+    def _three_owners(self):
+        c = _contract("0xOWNER")
         c.add_subject("refunds", A["title"], A["body"], "payments, contract")
-        c.add_subject("faraway", "Docs style", "Headings are sentence case.", "docs")
-        c.add_subject("chargebacks", B["title"], B["body"], "payments, contract")
-        decoy, overlap = c._hardest_decoy("refunds")
-        assert decoy == "chargebacks" and overlap == 2
+        _as("0xSECOND"); c.add_subject("chargebacks", B["title"], B["body"], "payments, contract")
+        _as("0xTHIRD"); c.add_subject("holds", "Held funds", "Funds are held for 21 days.", "payments")
+        _as("0xFOURTH"); c.add_subject("faraway", "Docs style", "Headings are sentence case.", "docs")
+        return c
 
-    def test_the_earliest_subject_wins_a_tie_so_the_decoy_is_stable(self):
-        c = _contract()
-        c.add_subject("refunds", A["title"], A["body"], "payments")
-        c.add_subject("first", "One", "One body.", "payments")
-        c.add_subject("second", "Two", "Two body.", "payments")
-        assert c._hardest_decoy("refunds") == ("first", 1)
+    def test_the_field_is_the_nearest_subjects_not_the_first_ones_added(self):
+        """The near neighbour arrives last here, so a field built in insertion
+        order would miss it."""
+        c = _contract("0xOWNER")
+        c.add_subject("refunds", A["title"], A["body"], "payments, contract")
+        _as("0xSECOND"); c.add_subject("weak", "Weak", "One tag only.", "payments")
+        _as("0xTHIRD"); c.add_subject("weaker", "Weaker", "One tag only.", "payments")
+        _as("0xFOURTH"); c.add_subject("chargebacks", B["title"], B["body"], "payments, contract")
+        assert c._field("refunds", ADDR("0xWRITER"))[0] == ("chargebacks", 2)
 
-    def test_a_register_of_one_has_nothing_to_tell_it_apart_from(self):
-        c = _contract()
+    def test_a_subject_sharing_no_tag_is_never_in_the_field(self):
+        """One neighbour and one stranger is not a field of two: it is one test
+        and one free pass, so the contract produces no test at all."""
+        c = _contract("0xOWNER")
         c.add_subject("refunds", A["title"], A["body"], "payments")
-        assert c._hardest_decoy("refunds") == ("", 0)
-        _as("0xWRITER"); c.respond("r1", "refunds", "a careful response")
+        _as("0xSECOND"); c.add_subject("near", "Near", "Shares a tag.", "payments")
+        _as("0xTHIRD"); c.add_subject("faraway", "Docs style", "Headings are sentence case.", "docs")
+        field = c._field("refunds", ADDR("0xWRITER"))
+        assert [d for d, _ in field] == ["near"]
+        _as("0xWRITER"); c.respond("r1", "refunds", "a careful response about the refund window")
         with pytest.raises(tt.gl.vm.UserError) as e:
             c.test("r1")
-        assert "needs a second subject" in str(e.value)
+        assert "and this register has 1" in str(e.value)
+
+    def test_one_slot_per_owner_so_one_account_cannot_fill_the_field(self):
+        """Tags are self-declared, so a patsy is always possible. It can take at
+        most one slot, and the honest neighbour still has to be beaten."""
+        c = self._three_owners()
+        _as("0xSECOND")
+        c.add_subject("patsy", "x", "y", "payments, contract")
+        field = c._field("refunds", ADDR("0xWRITER"))
+        assert len(field) == 2 and field[0][0] == "chargebacks"
+        assert "patsy" not in [d for d, _ in field]      # its owner already holds a slot
+
+    def test_the_author_cannot_supply_their_own_examiner(self):
+        c = self._three_owners()
+        _as("0xWRITER")
+        c.add_subject("mine", "x", "y", "payments, contract")
+        assert "mine" not in [d for d, _ in c._field("refunds", ADDR("0xWRITER"))]
+
+    def test_the_earliest_subject_wins_a_tie_so_the_field_is_stable(self):
+        c = _contract()
+        c.add_subject("refunds", A["title"], A["body"], "payments")
+        _as("0xSECOND"); c.add_subject("first", "One", "One body.", "payments")
+        _as("0xTHIRD"); c.add_subject("second", "Two", "Two body.", "payments")
+        assert [d for d, _ in c._field("refunds", ADDR("0xWRITER"))] == ["first", "second"]
+
+    def test_a_register_is_bounded_so_the_field_is_built_in_bounded_work(self, monkeypatch):
+        """A view that walks an unbounded list stops being callable, and a
+        payment decision that reads it stops being answerable."""
+        monkeypatch.setattr(tt, "MAX_SUBJECTS", 2)
+        c = _contract()
+        c.add_subject("one", "One", "One body.", "payments")
+        c.add_subject("two", "Two", "Two body.", "payments")
+        with pytest.raises(tt.gl.vm.UserError) as e:
+            c.add_subject("three", "Three", "Three body.", "payments")
+        assert "register is full" in str(e.value)
+        assert json.loads(c.rules())["max_subjects"] == 2
 
 
 class TestTesting:
     def _ready(self):
         c = _contract()
         c.add_subject("refunds", A["title"], A["body"], "payments, contract")
-        c.add_subject("chargebacks", B["title"], B["body"], "payments, contract")
+        _as("0xSECOND"); c.add_subject("chargebacks", B["title"], B["body"], "payments, contract")
+        _as("0xTHIRD"); c.add_subject("holds", "Held funds", "Funds are held for 21 days.", "payments")
         _as("0xWRITER")
         c.respond("r1", "refunds", "The 30 day window contradicts the 45 day rule in clause 4.")
         return c
 
-    def test_a_pass_records_the_decoy_it_was_told_apart_from(self):
-        c = self._ready(); _judging(c, tt.SPECIFIC, "it engages with the 30 day window")
+    def test_a_pass_records_the_field_it_was_told_apart_from(self):
+        c = self._ready(); _judging(c, tt.SPECIFIC)
         out = json.loads(c.test("r1"))
-        assert out["status"] == tt.SPECIFIC and out["decoy"] == "chargebacks" and out["shared_tags"] == 2
+        assert out["status"] == tt.SPECIFIC and out["decoys"] == ["chargebacks", "holds"]
+        assert out["shared_tags"] == 1                    # the fewest any decoy shared
         assert c.is_specific("r1") is True
         row = json.loads(c.response("r1"))
-        assert row["tests"] == 1 and "30 day window" in row["reason"]
+        assert row["tested"] is True
+        assert row["reason"] == "told apart from chargebacks and holds, both ways round"
 
     def test_a_generic_response_is_named_as_such_and_never_paid(self):
-        c = self._ready(); _judging(c, tt.GENERIC, "it would fit either subject")
+        c = self._ready(); _judging(c, tt.GENERIC)
         json.loads(c.test("r1"))
         assert json.loads(c.response("r1"))["status"] == tt.GENERIC
         assert c.is_specific("r1") is False
 
-    def test_a_response_about_the_other_subject_is_called_misfiled(self):
+    def test_a_response_about_another_subject_is_called_misfiled(self):
         c = self._ready(); _judging(c, tt.MISFILED)
         json.loads(c.test("r1"))
         assert json.loads(c.response("r1"))["status"] == tt.MISFILED
 
-    def test_the_same_question_cannot_be_asked_again(self):
+    def test_a_verdict_is_final_so_nobody_can_shop_for_a_better_one(self):
         c = self._ready(); _judging(c, tt.GENERIC)
         c.test("r1")
         _judging(c, tt.SPECIFIC)                      # a luckier answer is not available
         with pytest.raises(tt.gl.vm.UserError) as e:
             c.test("r1")
-        assert "a harder decoy" in str(e.value)
+        assert "verdict is final" in str(e.value)
         assert json.loads(c.response("r1"))["status"] == tt.GENERIC
 
-    def test_a_harder_decoy_may_reopen_it_and_the_standard_only_rises(self):
+    def test_a_verdict_is_final_so_nobody_can_destroy_one_either(self):
+        """A retest against a fresh subject would let a stranger break a
+        `specific` somebody earned but has not been paid for yet."""
         c = self._ready(); _judging(c, tt.SPECIFIC)
         c.test("r1")
-        assert json.loads(c.response("r1"))["shared_tags"] == 2
-        _as("0xOWNER")
-        c.add_subject("closer", "Refund timing", "Refunds are timed from delivery.",
-                      "payments, contract, docs")
-        c.add_subject("refunds2", "x", "y", "payments, contract, docs")   # never chosen: later, same overlap
-        c.subjects["refunds"].tags_json = json.dumps(["contract", "docs", "payments"])
-        _judging(c, tt.GENERIC, "the closer subject fits it too")
-        out = json.loads(c.test("r1"))
-        assert out["decoy"] == "closer" and out["shared_tags"] == 3
-        assert json.loads(c.response("r1"))["status"] == tt.GENERIC
-        assert json.loads(c.response("r1"))["tests"] == 2
+        _as("0xVANDAL")
+        c.add_subject("copy", A["title"], A["body"] + " Identical in every way.", "payments, contract")
+        _judging(c, tt.GENERIC)
+        with pytest.raises(tt.gl.vm.UserError):
+            c.test("r1")
+        assert c.is_specific("r1") is True
+
+    def test_the_same_work_cannot_be_resubmitted_under_a_new_name(self):
+        """Without this the same words go back in as r2 and the test runs from
+        scratch: an unlimited re-roll, and a budget paying per id pays twice."""
+        c = self._ready()
+        _as("0xWRITER")
+        with pytest.raises(tt.gl.vm.UserError) as e:
+            c.respond("r2", "refunds", "  THE 30 DAY WINDOW contradicts the 45 day rule in clause 4. ")
+        assert "already been submitted" in str(e.value)
+
+    def test_a_response_the_fence_would_rewrite_is_refused_instead(self):
+        """The fence keeps the boundary but would turn "x > y" into "x ) y", so
+        the contract refuses the text rather than judge a sentence nobody wrote."""
+        c = self._ready()
+        _as("0xWRITER")
+        with pytest.raises(tt.gl.vm.UserError) as e:
+            c.respond("r4", "refunds", "The 30 day window is > the 21 day hold in clause 9.")
+        assert "write the comparison in words" in str(e.value)
+
+    def test_a_response_cannot_be_the_subject_read_back(self):
+        c = self._ready()
+        _as("0xWRITER")
+        with pytest.raises(tt.gl.vm.UserError) as e:
+            c.respond("r3", "refunds", A["body"])
+        assert "read back to itself" in str(e.value)
 
     def test_an_unknown_response_is_refused_before_any_model_runs(self):
         c = self._ready()
@@ -391,16 +464,17 @@ class TestTesting:
 
 
 class TestDiscriminating:
-    """The inside of the consensus block: two forced choices, one stored word."""
+    """The inside of the consensus block: two forced choices per decoy, one stored word."""
 
-    def _run(self, answers):
+    def _run(self, answers, decoys=None):
         c = _contract()
+        decoys = decoys if decoys is not None else [B]
         seen = []
         captured = {}
 
         def exec_prompt(task, response_format=None):
             seen.append(task)
-            return answers[(len(seen) - 1) % len(answers)]   # a validator re-runs the pair
+            return answers[(len(seen) - 1) % len(answers)]   # a validator re-runs the field
 
         def run_nondet(leader, validator):
             captured["leader"] = leader
@@ -409,29 +483,35 @@ class TestDiscriminating:
 
         tt.gl.nondet = types.SimpleNamespace(exec_prompt=exec_prompt)
         tt.gl.vm.run_nondet = run_nondet
-        result = c._discriminate("a careful response", A, B)
+        result = c._discriminate("a careful response", A, decoys)
         return result, seen, captured
 
-    def test_the_pair_is_shown_twice_with_the_subjects_swapped(self):
-        (outcome, reason), seen, _ = self._run([{"pick": "a", "reason": "it names the 30 day window"},
-                                                {"pick": "b", "reason": "same"}])
-        assert outcome == tt.SPECIFIC and "30 day window" in reason
+    def test_each_decoy_is_shown_twice_with_the_subjects_swapped(self):
+        outcome, seen, _ = self._run([{"pick": "a"}, {"pick": "b"}])
+        assert outcome == tt.SPECIFIC
         assert len(seen) == 2 and seen[0] != seen[1]
         assert seen[0].index("Refund window") < seen[0].index("Chargeback fees")
         assert seen[1].index("Chargeback fees") < seen[1].index("Refund window")
 
     def test_a_text_that_commands_a_letter_cannot_pass(self):
-        """Picking A both times is what a letter-hijack produces; it stores nothing."""
-        (outcome, reason), _, _ = self._run([{"pick": "a", "reason": "x"}, {"pick": "a", "reason": "y"}])
-        assert outcome == tt.UNCLEAR and "disagreed" in reason
+        """Picking A both times is what a letter hijack produces; it stores nothing."""
+        outcome, _, _ = self._run([{"pick": "a"}, {"pick": "a"}])
+        assert outcome == tt.UNCLEAR
 
     def test_either_both_ways_round_is_generic(self):
-        (outcome, _), _, _ = self._run([{"pick": "either", "reason": "fits both"},
-                                        {"pick": "either", "reason": "fits both"}])
+        outcome, _, _ = self._run([{"pick": "either"}, {"pick": "either"}])
         assert outcome == tt.GENERIC
 
+    def test_every_decoy_has_to_be_beaten(self):
+        """Four prompts for two decoys, and one failure is enough to fail the test."""
+        far = {"title": "Held funds", "body": "Funds are held for 21 days."}
+        outcome, seen, _ = self._run([{"pick": "a"}, {"pick": "b"},
+                                      {"pick": "either"}, {"pick": "either"}], [B, far])
+        assert len(seen) == 4
+        assert outcome == tt.GENERIC          # beat the first decoy, fitted the second
+
     def test_a_validator_agrees_only_when_it_derived_the_same_word(self):
-        _, _, captured = self._run([{"pick": "a", "reason": "x"}, {"pick": "b", "reason": "y"}])
+        _, _, captured = self._run([{"pick": "a"}, {"pick": "b"}])
 
         class _Ret(tt.gl.vm.Return):
             def __init__(self, calldata): self.calldata = calldata
@@ -439,6 +519,39 @@ class TestDiscriminating:
         assert captured["validator"](_Ret({"outcome": tt.SPECIFIC})) is True
         assert captured["validator"](_Ret({"outcome": tt.GENERIC})) is False
         assert captured["validator"](_Ret("not an object")) is False
+
+    def test_a_validator_whose_own_judge_misbehaves_disagrees_instead_of_escaping(self):
+        _, _, captured = self._run([{"pick": "a"}, {"pick": "b"}])
+
+        class _Ret(tt.gl.vm.Return):
+            def __init__(self, calldata): self.calldata = calldata
+
+        tt.gl.nondet = types.SimpleNamespace(exec_prompt=lambda *a, **k: {"pick": "maybe"})
+        assert captured["validator"](_Ret({"outcome": tt.SPECIFIC})) is False
+
+    def test_a_judge_that_cannot_be_reached_is_a_transient_failure(self):
+        """Classified so two nodes that both hit it agree, instead of one storing a guess."""
+        c = _contract()
+        def boom(*a, **k): raise RuntimeError("connection reset")
+        tt.gl.nondet = types.SimpleNamespace(exec_prompt=boom)
+        tt.gl.vm.run_nondet = lambda leader, validator: leader()
+        with pytest.raises(tt.gl.vm.UserError) as e:
+            c._discriminate("a response", A, [B])
+        assert tt.ERROR_TRANSIENT in str(e.value)
+
+
+class TestCombine:
+    def test_a_response_must_beat_every_decoy(self):
+        assert tt._combine([tt.SPECIFIC, tt.SPECIFIC]) == tt.SPECIFIC
+        assert tt._combine([tt.SPECIFIC, tt.GENERIC]) == tt.GENERIC
+        assert tt._combine([tt.SPECIFIC, tt.UNCLEAR]) == tt.UNCLEAR
+
+    def test_being_about_another_subject_is_reported_before_anything_else(self):
+        assert tt._combine([tt.MISFILED, tt.GENERIC]) == tt.MISFILED
+        assert tt._combine([tt.GENERIC, tt.UNCLEAR]) == tt.GENERIC
+
+    def test_an_empty_field_claims_nothing(self):
+        assert tt._combine([]) == tt.UNCLEAR
 
 
 class TestViews:
@@ -452,23 +565,26 @@ class TestViews:
         rules = json.loads(c.rules())
         assert rules["orders"] == 2 and rules["agreed"] == ["outcome"]
         assert rules["vocabulary"] == sorted(VOCAB)
-        assert "earliest wins a tie" in rules["decoy"]
+        assert "one per owner" in rules["field"]
+        assert rules["retest"].startswith("none")
 
     def test_responses_to_a_subject_are_listed_with_their_verdicts(self):
         c = _contract()
         c.add_subject("refunds", A["title"], A["body"], "payments")
-        c.add_subject("chargebacks", B["title"], B["body"], "payments")
+        _as("0xSECOND"); c.add_subject("chargebacks", B["title"], B["body"], "payments")
+        _as("0xTHIRD"); c.add_subject("holds", "Held funds", "Funds are held for 21 days.", "payments")
         _as("0xWRITER"); c.respond("r1", "refunds", "a careful response"); _judging(c, tt.SPECIFIC)
         c.test("r1")
         rows = json.loads(c.responses_to("refunds"))
-        assert len(rows) == 1 and rows[0]["status"] == tt.SPECIFIC and rows[0]["decoy"] == "chargebacks"
+        assert len(rows) == 1 and rows[0]["status"] == tt.SPECIFIC
+        assert rows[0]["decoys"] == ["chargebacks", "holds"]
 
 
 # ---------------------------------------------------------------- the fixture
 
 class TestPiecework:
     def _budget(self, row, subject_owner="0xOWNER", pool=100, rate=10,
-                subject_row=None, raising=False, response_raising=False,
+                subject_row=None, raising=False, response_raising=False, min_shared=1,
                 opened="2026-09-01T00:00:00Z", now="2026-09-16T00:00:00Z", buyer="0xBUYER"):
         paid = []
         subject = subject_row if subject_row is not None else {"subject": "refunds", "owner": "0xOWNER"}
@@ -493,12 +609,12 @@ class TestPiecework:
         b = pw.Piecework.__new__(pw.Piecework)
         b.register = pw.gl.Address("0xREGISTER"); b.subject_id = "refunds"
         b.subject_owner = pw.gl.Address(subject_owner); b.buyer = pw.gl.Address("0xBUYER")
-        b.rate = rate; b.opened_at = opened; b.open_days = 7
+        b.rate = rate; b.min_shared = min_shared; b.opened_at = opened; b.open_days = 7
         b.pool = pool; b.paid_total = 0; b.paid = {}; b.paid_ids = []
         return b, paid
 
     SPECIFIC = {"response": "r1", "subject": "refunds", "author": "0xWRITER",
-                "status": "specific", "decoy": "chargebacks", "shared_tags": 2}
+                "status": "specific", "decoys": ["chargebacks", "holds"], "shared_tags": 2}
     GENERIC = dict(SPECIFIC, status="generic")
 
     def test_work_that_passed_the_test_is_paid_at_the_rate(self):
@@ -508,6 +624,15 @@ class TestPiecework:
         assert out["paid"] == "0xWRITER" and out["amount"] == "10"
         assert paid == [("0xWRITER", 10)]
         assert json.loads(b.status())["pool"] == "90"
+
+    def test_a_pass_against_an_easy_field_is_not_what_this_budget_asked_for(self):
+        """The buyer says how hard the test had to be, because a pass against a
+        field sharing almost nothing is a pass against strangers."""
+        b, paid = self._budget(dict(self.SPECIFIC, shared_tags=1), min_shared=2)
+        assert "this budget asks for 2" in b.would_pay("r1")
+        with pytest.raises(pw.gl.vm.UserError):
+            b.pay("r1")
+        assert paid == []
 
     def test_generic_work_is_not_paid_and_the_reason_is_readable(self):
         b, paid = self._budget(self.GENERIC)
@@ -582,7 +707,7 @@ class TestStaticRules:
     OPEN_ON_PURPOSE = {
         "add_subject": "anyone may put their own subject on the register; the sender becomes its owner, and that binding is what a budget ties itself to",
         "respond": "anyone may submit work about anyone's subject, because a register where only invited accounts may write has already decided whose work counts; being paid is what waits for the test",
-        "test": "anyone may ask for the test, and the caller chooses nothing in it: the decoy, the two orders and the retest rule are all the contract's",
+        "test": "anyone may ask for the test, and an author should not wait on a buyer's goodwill for a verdict the validators can reach without either of them; what the caller does not choose is the field, the orders, or a second chance, because a verdict is final",
     }
     OPEN_FIXTURE = {
         "fund": "anyone may add to a budget",
@@ -635,6 +760,12 @@ class TestStaticRules:
         assert inside == 2, "both orders belong inside the leader closure"
         assert inside == everywhere, "a model call outside the closure is never repeated by a validator"
 
+    def test_the_field_is_walked_inside_the_closure_too(self):
+        """Every decoy is judged by every validator, not only the leader's first one."""
+        fn = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef) and n.name == "_discriminate")
+        leader = next(n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef) and n.name == "leader_fn")
+        assert any(isinstance(n, ast.For) and ast.unparse(n.iter) == "decoys" for n in ast.walk(leader))
+
     def test_the_second_order_really_swaps_the_two_subjects(self):
         fn = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef) and n.name == "_discriminate")
         body = ast.unparse(fn)
@@ -646,6 +777,15 @@ class TestStaticRules:
         body = ast.unparse(validator)
         assert "leader_fn()" in body, "a validator that never does the work has not checked it"
         assert "outcome" in body
+
+    def test_a_verdict_is_written_once_and_never_rewritten(self):
+        """Any assignment to `status` outside the one test is a way to overwrite
+        somebody else's earned verdict."""
+        writes = [n for n in ast.walk(TREE)
+                  if isinstance(n, ast.Attribute) and n.attr == "status" and isinstance(n.ctx, ast.Store)]
+        assert len(writes) == 1, "a verdict is written in one place only, and `test` refuses a second run"
+        fn = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef) and n.name == "test")
+        assert "if bool(response.tested):" in ast.unparse(fn), "the one place must be guarded by finality"
 
     def test_the_budget_reads_the_same_clock_the_register_writes(self):
         here = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef) and n.name == "_now")

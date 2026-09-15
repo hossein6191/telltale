@@ -9,28 +9,35 @@ it is what a buyer of written work keeps paying for by mistake.
 
 This register settles that by forced choice rather than by taste. It never asks
 a validator whether a response is good. It shows the response next to two
-subjects, the real one and a decoy the contract chose, and asks which subject
-the response is about. The decoy is not a random other subject: it is the one
-sharing the most tags with the real one, so the test is always run against the
-hardest neighbour on the register.
+subjects, the real one and a decoy, and asks which subject the response is
+about. Every answer is one of three words and the pair is asked twice, with the
+two subjects swapped:
 
     points at the real subject in both orders   -> specific
     points at the decoy in both orders          -> misfiled, and it says so
     says either would fit, in both orders       -> generic
     the two orders disagree                     -> unclear, nothing is claimed
 
-The two orders swap which subject is called A. That is what makes the test
-robust against position bias, and it has a second effect worth knowing: a
-response that tries to command the judge by naming a letter points at the real
-subject in one order and at the decoy in the other, so it can never come out
-`specific`. The trick defeats itself.
+The response has to beat **every** decoy in its field to come out `specific`,
+and the field is built to be hard to buy: the subjects sharing the most tags,
+**one per owner**, and never one owned by the response's own author. Tags are
+self-declared, so a single account can always add a subject that looks like a
+neighbour and is really a patsy. It can occupy at most one slot, and the honest
+neighbour still has to be beaten.
 
-A response can be tested again only against a strictly harder decoy, that is,
-one sharing more tags than the decoy it already faced. Nobody can re-roll a
-verdict by asking again, and a register that grows only ever makes the standard
-higher.
+Two properties fall out of the shape rather than being bolted on. A response
+that tries to command the judge by naming a letter points at the real subject in
+one order and at the decoy in the other, so it can never come out `specific`:
+the trick defeats itself. And because the subjects are swapped between runs,
+no amount of position anchoring survives both.
+
+A response is submitted once and tested once. The text is deduplicated per
+subject, so the same work cannot be resubmitted under a new name until a round
+comes out better, and a verdict once reached is never overwritten, so nobody can
+destroy work somebody else has earned.
 """
 
+import hashlib
 import json
 import typing
 from dataclasses import dataclass
@@ -64,6 +71,9 @@ MAX_RESPONSE_CHARS = 1500
 MAX_REASON_CHARS = 300
 MAX_TAGS = 6
 MAX_VOCABULARY = 24
+MAX_DECOYS = 2                   # subjects a response must be told apart from, each owned by a different account
+MAX_SUBJECTS = 200               # a register is bounded, so the field is built in bounded work
+MAX_LISTED = 50                  # rows a listing view returns, so no reader walks an unbounded list
 
 
 def _fail(message: str) -> typing.NoReturn:
@@ -93,11 +103,23 @@ def _fence(raw: typing.Any) -> str:
     return str(raw).replace("<", "(").replace(">", ")")
 
 
+ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
 def _clean_id(raw: str) -> str:
     value = str(raw).strip().lower()
-    if not value or len(value) > MAX_ID_CHARS or not all(c.isalnum() or c in "-_" for c in value):
-        _fail("an id is 1 to " + str(MAX_ID_CHARS) + " characters: letters, digits, - or _")
+    if not value or len(value) > MAX_ID_CHARS or not all(c in ID_CHARS for c in value):
+        _fail("an id is 1 to " + str(MAX_ID_CHARS) + " characters: a to z, 0 to 9, - or _")
     return value
+
+
+def _normalised(text: str) -> str:
+    return " ".join(str(text).lower().split())
+
+
+def _digest(text: str) -> str:
+    """One response, one digest: the same words are never judged twice for one subject."""
+    return hashlib.sha256(_normalised(text).encode("utf-8")).hexdigest()
 
 
 def _subject_block(label: str, title: str, body: str) -> str:
@@ -125,21 +147,22 @@ def _task(response_text: str, first: dict, second: dict) -> str:
         "Which subject is the response about? Judge only by what the response engages with: "
         "the details, wording, decisions or problems that belong to one subject and not the other.",
         "Answer \"" + PICK_A + "\" or \"" + PICK_B + "\" only when the response engages with "
-        "something particular to that subject. Answer \"" + PICK_EITHER + "\" when the response "
-        "would fit both subjects equally, because it says nothing that belongs to one of them "
-        "in particular. A response that merely repeats a title fits both.",
-        "Return JSON: {\"pick\": one of " + ", ".join(PICKS) + ", \"reason\": \"one short sentence\"}",
+        "something particular to that subject: a decision it makes, a gap it leaves, a "
+        "consequence of what it says. Answer \"" + PICK_EITHER + "\" when the response would fit "
+        "both subjects equally, because it says nothing that belongs to one of them in "
+        "particular. Repeating a subject's own words back, whether its title or its body, is "
+        "not engaging with it.",
+        "Return JSON: {\"pick\": one of " + ", ".join(PICKS) + "}",
     ])
 
 
-def _read_pick(raw: typing.Any) -> typing.Tuple[str, str]:
+def _read_pick(raw: typing.Any) -> str:
     if not isinstance(raw, dict):
         raise gl.vm.UserError(ERROR_LLM + " the judge did not answer with an object")
     pick = str(raw.get("pick", "")).strip().lower()
     if pick not in PICKS:
         raise gl.vm.UserError(ERROR_LLM + " the judge answered outside the set: " + pick[:40])
-    reason = str(raw.get("reason", "")).strip()[:MAX_REASON_CHARS]
-    return pick, reason
+    return pick
 
 
 def _outcome(first_pick: str, second_pick: str) -> str:
@@ -157,6 +180,41 @@ def _outcome(first_pick: str, second_pick: str) -> str:
     if first_pick == PICK_EITHER and second_pick == PICK_EITHER:
         return GENERIC
     return UNCLEAR
+
+
+def _combine(words: list) -> str:
+    """One word for a field of decoys. A response must beat every one of them.
+
+    Anything short of beating all of them is not `specific`, and the reason it
+    fell short is reported as the worst thing any decoy revealed: being about
+    another subject first, then fitting one of them equally, then not settling.
+    """
+    if not words:
+        return UNCLEAR
+    if all(w == SPECIFIC for w in words):
+        return SPECIFIC
+    if MISFILED in words:
+        return MISFILED
+    if GENERIC in words:
+        return GENERIC
+    return UNCLEAR
+
+
+def _why(outcome: str, decoys: list) -> str:
+    """The sentence a reader gets, written by the contract from agreed values only.
+
+    The judge is never asked for prose. Two validators write different sentences
+    about the same forced choice, so a stored sentence would be one node's words
+    kept forever under the authority of everybody's agreement.
+    """
+    against = " and ".join(str(d) for d in decoys) if decoys else "nothing"
+    if outcome == SPECIFIC:
+        return "told apart from " + against + ", both ways round"
+    if outcome == MISFILED:
+        return "read as being about " + against + " rather than the subject it was filed under"
+    if outcome == GENERIC:
+        return "it fits " + against + " as well as the subject it was filed under"
+    return "the two readings disagreed, so nothing is claimed"
 
 
 def _handle_leader_error(leaders_res: typing.Any, leader_fn: typing.Any) -> bool:
@@ -191,16 +249,16 @@ class Subject:
 @allow_storage
 @dataclass
 class Response:
-    """One piece of written work, and the hardest decoy it has faced."""
+    """One piece of written work and the field of decoys it faced."""
 
     subject_id: str
     author: gl.Address
     text: str
     status: str                # untested | specific | generic | misfiled | unclear
-    decoy_id: str              # the subject it was told apart from; "" until tested
-    decoy_overlap: gl.u32      # tags shared with that decoy; the difficulty of the test it passed
-    tests: gl.u32
-    reason: str                # the leader's sentence, kept so a verdict reads; see DECISIONS.md
+    decoys_json: str           # the subjects it was put against; "[]" until tested
+    min_shared: gl.u32         # fewest tags shared with any of them: the difficulty it faced
+    tested: bool
+    reason: str                # written by the contract from the agreed word, never by a model
     tested_at: str
 
 
@@ -210,6 +268,7 @@ class Telltale(gl.contract.Contract):
     subject_ids: gl.storage.DynArray[str]
     responses: gl.storage.TreeMap[str, Response]
     response_ids: gl.storage.DynArray[str]
+    tried: gl.storage.TreeMap[str, bool]     # subject_id|digest of work already submitted
 
     def __init__(self, vocabulary_csv: str) -> None:
         """The closed tag vocabulary is fixed here and never grows.
@@ -240,6 +299,9 @@ class Telltale(gl.contract.Contract):
         subject_id = _clean_id(subject_id)
         if subject_id in self.subjects:
             _fail("a subject named " + subject_id + " is already on the register")
+        if len(self.subject_ids) >= MAX_SUBJECTS:
+            _fail("this register is full at " + str(MAX_SUBJECTS) + " subjects; a field must be "
+                  "built in bounded work, so the register it is built from is bounded too")
         clean_title = str(title).strip()
         clean_body = str(body).strip()
         if not clean_title or len(clean_title) > MAX_TITLE_CHARS:
@@ -278,14 +340,27 @@ class Telltale(gl.contract.Contract):
         body = str(text).strip()
         if not body or len(body) > MAX_RESPONSE_CHARS:
             _fail("a response is 1 to " + str(MAX_RESPONSE_CHARS) + " characters")
+        if "<" in body or ">" in body:
+            _fail("a response cannot contain < or >, because they are replaced before the judge "
+                  "reads it; write the comparison in words")
+        key = subject_id + "|" + _digest(body)
+        if key in self.tried:
+            # Without this, the same words go back in under a new id and the
+            # test runs again from scratch: an unlimited re-roll, and a budget
+            # that pays per id would pay for one piece of work many times.
+            _fail("this text has already been submitted about " + subject_id
+                  + "; a different response, not the same one under a new name")
+        if _normalised(body) in _normalised(str(self.subjects[subject_id].body)):
+            _fail("a response cannot be the subject read back to itself; engage with it instead")
+        self.tried[key] = True
         self.responses[response_id] = Response(
             subject_id=subject_id,
             author=gl.message.sender_address,
             text=body,
             status=UNTESTED,
-            decoy_id="",
-            decoy_overlap=gl.u32(0),
-            tests=gl.u32(0),
+            decoys_json="[]",
+            min_shared=gl.u32(0),
+            tested=False,
             reason="",
             tested_at="",
         )
@@ -295,70 +370,91 @@ class Telltale(gl.contract.Contract):
 
     @gl.public.write
     def test(self, response_id: str) -> str:
-        """Run the discrimination test against the hardest decoy on the register.
+        """Run the discrimination test against the field, once and once only.
 
         Deliberately open: the buyer, the author, or anybody watching may ask
-        for it. Nobody can steer it, because the caller chooses nothing. The
-        decoy is picked by the contract, the two orders are built by the
-        contract, and asking again is refused unless the register itself has
-        produced a harder decoy since.
+        for it, and an author should not have to wait on a buyer's goodwill for
+        a verdict the validators can reach without either of them.
+
+        What the caller does not choose is anything about the test. The field
+        is built by the contract, both orders are built by the contract, and a
+        verdict is final: a response is tested once. That last rule is what
+        stops a stranger destroying a `specific` somebody has earned but not yet
+        been paid for, which a retest against a fresh subject would otherwise do.
         """
         response_id = _clean_id(response_id)
         if response_id not in self.responses:
             _fail("no response named " + response_id[:MAX_ID_CHARS])
         response = self.responses[response_id]
+        if bool(response.tested):
+            _fail("this response has already been tested and its verdict is final; a verdict "
+                  "that can be asked again is a verdict somebody can shop for, or destroy")
         subject_id = str(response.subject_id)
-        decoy_id, overlap = self._hardest_decoy(subject_id)
-        if not decoy_id:
-            _fail("a discrimination test needs a second subject to tell it apart from; "
-                  "add another subject to this register first")
-        if int(response.tests) > 0 and overlap <= int(response.decoy_overlap):
-            _fail("this response already faced " + str(response.decoy_id) + ", which shares "
-                  + str(int(response.decoy_overlap)) + " tag(s); a retest needs a harder decoy, "
-                  "not the same question asked again")
+        field = self._field(subject_id, response.author)
+        if len(field) < MAX_DECOYS:
+            _fail("a test needs " + str(MAX_DECOYS) + " subjects that share a tag with "
+                  + subject_id + ", owned by " + str(MAX_DECOYS) + " accounts other than this "
+                  "response's author, and this register has " + str(len(field)))
 
         real = self.subjects[subject_id]
-        decoy = self.subjects[decoy_id]
         real_side = {"title": str(real.title), "body": str(real.body)}
-        decoy_side = {"title": str(decoy.title), "body": str(decoy.body)}
-        outcome, reason = self._discriminate(str(response.text), real_side, decoy_side)
+        decoys = []
+        sides = []
+        shared = []
+        for decoy_id, overlap in field:
+            decoy = self.subjects[decoy_id]
+            decoys.append(decoy_id)
+            shared.append(overlap)
+            sides.append({"title": str(decoy.title), "body": str(decoy.body)})
+        outcome = self._discriminate(str(response.text), real_side, sides)
+        reason = _why(outcome, decoys)
 
         response.status = outcome
-        response.decoy_id = decoy_id
-        response.decoy_overlap = gl.u32(overlap)
-        response.tests = gl.u32(int(response.tests) + 1)
+        response.decoys_json = json.dumps(decoys)
+        response.min_shared = gl.u32(min(shared))
+        response.tested = True
         response.reason = reason
         response.tested_at = _now()
         return json.dumps({"ok": True, "response": response_id, "subject": subject_id,
-                           "decoy": decoy_id, "shared_tags": overlap, "status": outcome,
-                           "reason": reason, "tests": int(response.tests)})
+                           "decoys": decoys, "shared_tags": min(shared), "status": outcome,
+                           "reason": reason})
 
     # -------------------------------------------------------------- the judging
 
-    def _discriminate(self, text: str, real: dict, decoy: dict) -> typing.Tuple[str, str]:
-        """One response against two subjects, both ways round, agreed by validators.
+    def _discriminate(self, text: str, real: dict, decoys: list) -> str:
+        """One response against a field of decoys, both ways round for each.
 
-        Every validator runs both forced choices itself; nothing the leader saw
-        is trusted. What must match is the word this contract stores, exactly.
-        The sentence is the leader's and is kept only so a verdict can be read.
+        Every validator runs every forced choice itself; nothing the leader saw
+        is trusted. What must match is the single word this contract stores.
+        No prose crosses consensus, so no node's words are stored as everybody's.
         """
 
         def leader_fn() -> typing.Any:
-            first = gl.nondet.exec_prompt(_task(text, real, decoy), response_format="json")
-            first_pick, first_reason = _read_pick(first)
-            second = gl.nondet.exec_prompt(_task(text, decoy, real), response_format="json")
-            second_pick, second_reason = _read_pick(second)
-            outcome = _outcome(first_pick, second_pick)
-            reason = first_reason if outcome != UNCLEAR else (
-                "the two orders disagreed: " + first_pick + " then " + second_pick)
-            if outcome == GENERIC and second_reason and not first_reason:
-                reason = second_reason
-            return {"outcome": outcome, "reason": reason}
+            words = []
+            for decoy in decoys:
+                try:
+                    first = gl.nondet.exec_prompt(_task(text, real, decoy), response_format="json")
+                    second = gl.nondet.exec_prompt(_task(text, decoy, real), response_format="json")
+                except gl.vm.UserError:
+                    raise
+                except Exception as e:
+                    # The model itself was unreachable. Classified so two nodes
+                    # that both hit it agree, instead of one storing a guess.
+                    raise gl.vm.UserError(ERROR_TRANSIENT + " the judge could not be reached: "
+                                          + str(e)[:80])
+                words.append(_outcome(_read_pick(first), _read_pick(second)))
+            return {"outcome": _combine(words)}
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return _handle_leader_error(leaders_res, leader_fn)
-            mine = leader_fn()
+            try:
+                mine = leader_fn()
+            except Exception:
+                # This node's own judge answered outside the set, or fell over.
+                # Disagreeing rotates the round; agreeing would store a word
+                # this validator never derived.
+                return False
             theirs = leaders_res.calldata
             if not isinstance(theirs, dict):
                 return False
@@ -368,7 +464,7 @@ class Telltale(gl.contract.Contract):
         outcome = str(agreed.get("outcome", UNCLEAR))
         if outcome not in OUTCOMES:
             outcome = UNCLEAR
-        return outcome, str(agreed.get("reason", ""))[:MAX_REASON_CHARS]
+        return outcome
 
     # ------------------------------------------------------------------ helpers
 
@@ -387,24 +483,53 @@ class Telltale(gl.contract.Contract):
             _fail("a subject carries 1 to " + str(MAX_TAGS) + " tags from the register's vocabulary")
         return sorted(tags)
 
-    def _hardest_decoy(self, subject_id: str) -> typing.Tuple[str, int]:
-        """The subject sharing the most tags with this one, earliest wins a tie.
+    def _field(self, subject_id: str, author: typing.Any) -> list:
+        """The decoys a response must beat: nearest first, one per owner, never the author's.
 
-        Picking the nearest neighbour rather than any other subject is what
-        makes a pass worth something: the response was told apart from the
-        thing it was most likely to be confused with, not from a stranger.
+        Tags are self-declared, so the nearest neighbour by tags is a label a
+        stranger can forge: add a subject carrying every one of this subject's
+        tags, with a sentence of nonsense in it, and it becomes the "hardest"
+        neighbour forever. Three rules make that expensive rather than free.
+
+        One subject per owner, so a single account fills at most one slot. Never
+        a subject owned by the response's own author, so the person being judged
+        cannot supply their own examiner. And a decoy must share at least one
+        tag, so a sparse register produces no test at all rather than a trivial
+        pass against a stranger.
+
+        What is left is honest: a field is as hard as the accounts that built
+        the register, and `min_shared` on the row says how hard it was.
         """
         mine = json.loads(str(self.subjects[subject_id].tags_json))
-        best_id, best_overlap = "", -1
+        candidates = []
         for other in self.subject_ids:
             other_id = str(other)
             if other_id == subject_id:
                 continue
-            theirs = json.loads(str(self.subjects[other_id].tags_json))
+            subject = self.subjects[other_id]
+            if subject.owner == author:
+                continue
+            theirs = json.loads(str(subject.tags_json))
             overlap = len([t for t in mine if t in theirs])
-            if overlap > best_overlap:
-                best_id, best_overlap = other_id, overlap
-        return best_id, max(best_overlap, 0)
+            if overlap < 1:
+                continue
+            candidates.append([other_id, overlap, subject.owner.as_hex.lower()])
+        chosen = []
+        owners = []
+        taken = []
+        for _ in range(MAX_DECOYS):
+            best = None
+            for entry in candidates:
+                if entry[2] in owners or entry[0] in taken:
+                    continue
+                if best is None or entry[1] > best[1]:
+                    best = entry
+            if best is None:
+                break
+            chosen.append((best[0], best[1]))
+            owners.append(best[2])
+            taken.append(best[0])
+        return chosen
 
     # -------------------------------------------------------------------- views
 
@@ -430,8 +555,8 @@ class Telltale(gl.contract.Contract):
         return json.dumps({
             "response": key, "subject": str(r.subject_id), "author": r.author.as_hex,
             "text": str(r.text), "status": str(r.status),
-            "decoy": str(r.decoy_id) or None, "shared_tags": int(r.decoy_overlap),
-            "tests": int(r.tests), "reason": str(r.reason), "tested_at": str(r.tested_at),
+            "decoys": json.loads(str(r.decoys_json)), "shared_tags": int(r.min_shared),
+            "tested": bool(r.tested), "reason": str(r.reason), "tested_at": str(r.tested_at),
             "specific": str(r.status) == SPECIFIC,
         })
 
@@ -441,23 +566,27 @@ class Telltale(gl.contract.Contract):
         if key not in self.subjects:
             return json.dumps({"error": "no subject named " + key[:MAX_ID_CHARS]})
         s = self.subjects[key]
-        decoy_id, overlap = self._hardest_decoy(key)
+        field = self._field(key, gl.Address(ZERO))
         return json.dumps({
             "subject": key, "owner": s.owner.as_hex, "title": str(s.title), "body": str(s.body),
             "tags": json.loads(str(s.tags_json)), "posted_at": str(s.posted_at),
-            "hardest_decoy": decoy_id or None, "shared_tags": overlap,
+            "field": [d for d, _ in field], "shared_tags": min([o for _, o in field]) if field else 0,
+            "testable": len(field) >= MAX_DECOYS,
         })
 
     @gl.public.view
     def responses_to(self, subject_id: str) -> str:
+        """Every response to one subject, capped, so no reader walks an unbounded list."""
         key = str(subject_id).strip().lower()
         out = []
         for response_id in self.response_ids:
             r = self.responses[str(response_id)]
             if str(r.subject_id) == key:
                 out.append({"response": str(response_id), "author": r.author.as_hex,
-                            "status": str(r.status), "decoy": str(r.decoy_id) or None,
-                            "shared_tags": int(r.decoy_overlap), "reason": str(r.reason)})
+                            "status": str(r.status), "decoys": json.loads(str(r.decoys_json)),
+                            "shared_tags": int(r.min_shared), "reason": str(r.reason)})
+                if len(out) >= MAX_LISTED:
+                    break
         return json.dumps(out)
 
     @gl.public.view
@@ -477,9 +606,11 @@ class Telltale(gl.contract.Contract):
             "outcomes": list(OUTCOMES),
             "orders": 2,
             "agreed": ["outcome"],
-            "decoy": "the subject sharing the most tags, earliest wins a tie",
-            "retest": "only against a decoy sharing strictly more tags than the last one",
+            "field": "the " + str(MAX_DECOYS) + " subjects sharing the most tags, one per owner, "
+                     "never one owned by the response's author, each sharing at least one tag",
+            "retest": "none: a response is submitted once, tested once, and its verdict is final",
             "max_tags": MAX_TAGS,
-            "note": "specific means it could not have been about the nearest other subject, "
-                    "never that the work is good",
+            "max_subjects": MAX_SUBJECTS,
+            "note": "specific means it could not have been about the other subjects it was put "
+                    "against, never that the work is good",
         })

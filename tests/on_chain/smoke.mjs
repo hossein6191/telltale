@@ -59,10 +59,13 @@ const MISFILED = "The 15 dollar fee and the 21 day hold are both unexplained: sa
 
 const ownerKey = generatePrivateKey(); const owner = createAccount(ownerKey);
 const writer = createAccount(generatePrivateKey());
-await rpc("sim_fundAccount", { account_address: owner.address, amount: 600e18 });
-await rpc("sim_fundAccount", { account_address: writer.address, amount: 400e18 });
+const second = createAccount(generatePrivateKey());
+const third = createAccount(generatePrivateKey());
+for (const a of [owner, writer, second, third]) await rpc("sim_fundAccount", { account_address: a.address, amount: 500e18 });
 const co = createClient({ chain: NETWORK, account: owner });
 const cw = createClient({ chain: NETWORK, account: writer });
+const c2 = createClient({ chain: NETWORK, account: second });
+const c3 = createClient({ chain: NETWORK, account: third });
 const rd = createClient({ chain: NETWORK });
 const code = readFileSync(new URL("../../contracts/telltale.py", import.meta.url));
 const dh = await co.deployContract({ code, args: ["contract, payments, docs, security"], fees: await deployFees(co) });
@@ -95,15 +98,21 @@ const retry = async (client, fn, args, label) => {
   return r;
 };
 
-// 1. three subjects: two that share both tags, one far away
+// 1. four subjects from three accounts: two near neighbours, one stranger
 await send(co, "add_subject", ["refunds", REFUNDS[0], REFUNDS[1], "contract, payments"]);
 await send(co, "add_subject", ["style", STYLE[0], STYLE[1], "docs"]);
-const near = await send(co, "add_subject", ["chargebacks", CHARGEBACKS[0], CHARGEBACKS[1], "contract, payments"]);
-ok("three subjects are on the register", near.j?.ok === true && near.j?.subjects === 3, near.msg.slice(0, 70));
+await send(c2, "add_subject", ["chargebacks", CHARGEBACKS[0], CHARGEBACKS[1], "contract, payments"]);
+const near = await send(c3, "add_subject", ["holds", "Held funds", "Funds from a disputed order are held for 21 days before release.", "payments"]);
+ok("four subjects from three accounts are on the register",
+   near.j?.ok === true && near.j?.subjects === 4, near.msg.slice(0, 70));
 const subject = JSON.parse(String(await view("subject", ["refunds"])));
-ok("the decoy is the nearest neighbour, not the far one",
-   subject.hardest_decoy === "chargebacks" && subject.shared_tags === 2,
-   `${subject.hardest_decoy} sharing ${subject.shared_tags}`);
+ok("the field is the nearest neighbours, one per owner, and never the stranger",
+   JSON.stringify(subject.field) === JSON.stringify(["chargebacks", "holds"]) && subject.testable === true,
+   `${subject.field} sharing at least ${subject.shared_tags}`);
+const patsy = await send(c2, "add_subject", ["patsy", "Looks near", "Nothing to do with any of it.", "contract, payments"]);
+const after = JSON.parse(String(await view("subject", ["refunds"])));
+ok("a second subject from an account already in the field takes no extra slot",
+   patsy.j?.ok === true && !after.field.includes("patsy"), String(after.field));
 
 // 2. a tag outside the closed vocabulary is refused before any model runs
 const badTag = await send(co, "add_subject", ["nope", "x", "y", "quantum"]);
@@ -112,9 +121,16 @@ ok("a tag outside the register's vocabulary is refused",
 
 // 3. work that engages with one subject in particular
 await send(cw, "respond", ["r-specific", "refunds", SPECIFIC]);
+const dup = await send(cw, "respond", ["r-again", "refunds", "  " + SPECIFIC.toUpperCase() + " "]);
+ok("the same work cannot be resubmitted under a new name",
+   dup.exec === "ERROR" && dup.msg.includes("already been submitted"), dup.msg.slice(0, 90));
+const copied = await send(cw, "respond", ["r-copy", "refunds", REFUNDS[1]]);
+ok("a response cannot be the subject read back to itself",
+   copied.exec === "ERROR" && copied.msg.includes("read back to itself"), copied.msg.slice(0, 90));
 const specific = await retry(cw, "test", ["r-specific"], "the specific response");
-ok("a response that engages with the subject is told apart from its hardest decoy",
-   specific.applied && specific.j?.status === "specific" && specific.j?.decoy === "chargebacks",
+ok("a response that engages with the subject is told apart from every decoy in its field",
+   specific.applied && specific.j?.status === "specific"
+   && JSON.stringify(specific.j?.decoys) === JSON.stringify(["chargebacks", "holds"]),
    `${tally(specific)} -> ${specific.j?.status || specific.msg.slice(0, 70)}`);
 ok("the gate says it passed, for free", (await view("is_specific", ["r-specific"])) === true);
 
@@ -134,21 +150,47 @@ ok("naming a letter cannot make a response specific: the two orders see through 
    `${tally(hijack)} -> ${hijack.j?.status || hijack.msg.slice(0, 70)}`);
 ok("the gate refuses it too", (await view("is_specific", ["r-hijack"])) === false);
 
-// 6. work about the other subject, filed under this one
+// 6. work about another subject in the field, filed under this one
 await send(cw, "respond", ["r-misfiled", "refunds", MISFILED]);
 const misfiled = await retry(cw, "test", ["r-misfiled"], "the misfiled response");
 ok("work about the decoy is named misfiled rather than merely rejected",
    misfiled.applied && misfiled.j?.status === "misfiled",
    `${tally(misfiled)} -> ${misfiled.j?.status || misfiled.msg.slice(0, 70)}`);
 
-// 7. the same question cannot be asked again
+// 7. a verdict is final: it can be neither shopped for nor destroyed
 const twice = await send(cw, "test", ["r-generic"]);
-ok("a verdict cannot be re-rolled without a harder decoy",
-   twice.exec === "ERROR" && twice.msg.includes("harder decoy"), twice.msg.slice(0, 90));
+ok("a verdict cannot be asked again, by its author or by anybody else",
+   twice.exec === "ERROR" && twice.msg.includes("verdict is final"), twice.msg.slice(0, 90));
+const vandal = await send(c3, "test", ["r-specific"]);
+ok("a stranger cannot destroy a verdict somebody has earned but not been paid for",
+   vandal.exec === "ERROR" && vandal.msg.includes("verdict is final"), vandal.msg.slice(0, 90));
+ok("the earned verdict still stands", (await view("is_specific", ["r-specific"])) === true);
 
 const rows = JSON.parse(String(await view("responses_to", ["refunds"])));
-ok("every response is on the record with the decoy it faced", rows.length === 4,
+ok("every response is on the record with the field it faced", rows.length === 4,
    rows.map((r) => r.response + ":" + r.status).join(", "));
+ok("the stored sentence is the contract's, derived from the word every validator agreed",
+   rows.some((r) => r.reason === "told apart from chargebacks and holds, both ways round"),
+   rows.map((r) => r.reason).join(" | ").slice(0, 120));
+
+// 8. the consequence, deployed and read against the real register
+const budgetCode = readFileSync(new URL("../../contracts/fixtures/piecework.py", import.meta.url));
+const bh = await co.deployContract({ code: budgetCode, args: [A, "refunds", owner.address, "1000000000000000000", 1, 30], fees: await deployFees(co) });
+const P = (await co.waitForTransactionReceipt({ hash: bh, waitUntil: "decided", retries: 40, interval: 4000, fullTransaction: true }))?.data?.contract_address;
+console.log("\nPiecework at", P);
+const funded = await wait(await co.writeContract({ address: P, functionName: "fund", args: [], value: 5n * 10n ** 18n, fees: await deployFees(co) }));
+ok("the budget takes funds", funded.j?.ok === true, `pool ${funded.j?.pool}`);
+const paysFor = String(await rd.readContract({ address: P, functionName: "would_pay", args: ["r-specific"] }));
+ok("the budget reads the verdict across contracts, with no model and no consensus",
+   paysFor.startsWith("author " + writer.address), paysFor.slice(0, 100));
+const refuses = String(await rd.readContract({ address: P, functionName: "would_pay", args: ["r-generic"] }));
+ok("and pays nobody for work the register called generic",
+   refuses.startsWith("nobody") && refuses.includes("generic"), refuses.slice(0, 90));
+const wrongOwner = await co.deployContract({ code: budgetCode, args: [A, "refunds", third.address, "1000000000000000000", 1, 30], fees: await deployFees(co) });
+const W = (await co.waitForTransactionReceipt({ hash: wrongOwner, waitUntil: "decided", retries: 40, interval: 4000, fullTransaction: true }))?.data?.contract_address;
+const wrongSays = String(await rd.readContract({ address: W, functionName: "would_pay", args: ["r-specific"] }));
+ok("a budget tied to the wrong owner pays nobody: a name is a handle, not authority",
+   wrongSays.startsWith("nobody") && wrongSays.includes("not to the account"), wrongSays.slice(0, 100));
 
 console.log(`\n${pass} passed, ${fail} failed  · register ${A}`);
 process.exit(fail ? 1 : 0);

@@ -1,6 +1,6 @@
 # { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
-"""Piecework: a budget that only pays for work that passed the test.
+"""Piecework: a budget that only pays for work that passed a test of a stated difficulty.
 
 This is the consequence, and it is the reason the register's verdict is worth
 reaching consensus about. A buyer puts money behind one subject and a rate per
@@ -11,8 +11,9 @@ no validator: did this response tell the subject apart from its hardest decoy?
     specific  -> the author the register recorded is paid the rate, once
     anything else -> nobody is paid, and the reason is readable
 
-The buyer binds three things before any money moves: the register address, the
-subject id, and the address they independently know to own that subject. A
+The buyer binds four things before any money moves: the register address, the
+subject id, the address they independently know to own that subject, and how
+many tags the field a response beat had to share with it. A
 subject id is first come first served on a register, so the id alone is never
 authority. If the subject under that name turns out to belong to somebody else,
 this budget pays nobody and the buyer can take the money back.
@@ -92,6 +93,7 @@ class Piecework(gl.contract.Contract):
     subject_owner: gl.Address  # who the buyer knows owns it, bound before any money moved
     buyer: gl.Address
     rate: gl.u256              # paid per accepted response
+    min_shared: gl.u32         # tags a response's field had to share before this budget counts it
     opened_at: str
     open_days: gl.u32
     pool: gl.u256
@@ -100,7 +102,7 @@ class Piecework(gl.contract.Contract):
     paid_ids: gl.storage.DynArray[str]
 
     def __init__(self, register: str, subject_id: str, subject_owner: str,
-                 rate: int, open_days: int) -> None:
+                 rate: int, min_shared: int, open_days: int) -> None:
         self.register = gl.Address(register)
         cleaned = str(subject_id).strip().lower()
         if not cleaned:
@@ -117,11 +119,23 @@ class Piecework(gl.contract.Contract):
             _fail("the window is a whole number of days")
         if days < MIN_DAYS or days > MAX_DAYS:
             _fail("the window is " + str(MIN_DAYS) + " to " + str(MAX_DAYS) + " days")
+        try:
+            floor = int(min_shared)
+        except Exception:
+            _fail("the minimum shared tags is a whole number")
+        if floor < 0:
+            _fail("the minimum shared tags is zero or more")
+        opened = _now()
+        if not opened:
+            # Without a clock the window can never close and `reclaim` can never
+            # run, so the budget would take money it could never give back.
+            _fail("this chain gave no readable clock, so a budget opened now could never be closed")
         self.subject_id = cleaned
         self.subject_owner = gl.Address(str(subject_owner).strip())
         self.buyer = gl.message.sender_address
         self.rate = gl.u256(rate_value)
-        self.opened_at = _now()
+        self.min_shared = gl.u32(floor)
+        self.opened_at = opened
         self.open_days = gl.u32(days)
         self.pool = gl.u256(0)
         self.paid_total = gl.u256(0)
@@ -174,12 +188,21 @@ class Piecework(gl.contract.Contract):
         status = str(row.get("status", ""))
         if status != "specific":
             return {"do": "no", "why": "the register says this response is " + (status or "untested")}
+        try:
+            shared = int(row.get("shared_tags", 0))
+        except Exception:
+            shared = 0
+        if shared < int(self.min_shared):
+            # A pass against a field that shared almost nothing is a pass against
+            # strangers. The buyer says here how hard the test had to be.
+            return {"do": "no", "why": "it was told apart from a field sharing " + str(shared)
+                                       + " tag(s) and this budget asks for " + str(int(self.min_shared))}
         if int(self.pool) < int(self.rate):
             return {"do": "no", "why": "the budget is down to " + str(int(self.pool))
                                        + " and the rate is " + str(int(self.rate))}
         return {"do": "yes", "to": str(row.get("author", ZERO)),
-                "why": "told apart from " + str(row.get("decoy", "")) + ", which shares "
-                       + str(row.get("shared_tags", 0)) + " tag(s)"}
+                "why": "told apart from " + ", ".join([str(d) for d in (row.get("decoys") or [])])
+                       + ", sharing at least " + str(shared) + " tag(s)"}
 
     @gl.public.write
     def pay(self, response_id: str) -> str:
@@ -198,6 +221,8 @@ class Piecework(gl.contract.Contract):
         if payee.as_hex.lower() == ZERO:
             _fail("the register names no author for that response")
         amount = self.rate
+        # Latch before paying: the state this contract will be read in next is
+        # written before anything leaves it.
         self.paid[key] = True
         self.paid_ids.append(key)
         self.pool = gl.u256(int(self.pool) - int(amount))
@@ -244,6 +269,7 @@ class Piecework(gl.contract.Contract):
             "subject_owner": self.subject_owner.as_hex,
             "buyer": self.buyer.as_hex,
             "rate": str(int(self.rate)),
+            "min_shared": int(self.min_shared),
             "opened_at": str(self.opened_at),
             "open_days": int(self.open_days),
             "pool": str(int(self.pool)),

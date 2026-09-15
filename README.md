@@ -26,7 +26,7 @@ A response has to beat **every** decoy in its field to come out `specific`.
 | `contracts/telltale.py` | the register: subjects, tags, responses, the field rule, the forced choice, `is_specific` |
 | `contracts/fixtures/piecework.py` | the consequence: a budget that pays per response, only for the ones that passed a test of a stated difficulty |
 | `tests/test_pure.py` | 79 tests with a GenLayer stub, including static checks over the parsed source |
-| `tools/mutate.py` → `tests/MUTATIONS.md` | 44 defences removed one at a time, each killed by a named test |
+| `tools/mutate.py` → `tests/MUTATIONS.md` | 45 defences removed one at a time, each killed by a named test |
 | `tests/on_chain/smoke.mjs` | the same story against Studio Next, from throwaway accounts |
 | `DECISIONS.md` | the boundary, and the decisions that are not obvious from the code |
 
@@ -127,7 +127,7 @@ validators already accepted.
 
 ```bash
 pip install -r requirements-dev.txt && python -m pytest -q tests/   # 79 tests, no network, under a second
-python tools/mutate.py                       # 44 mutants, all must die, writes tests/MUTATIONS.md
+python tools/mutate.py                       # 45 mutants, all must die, writes tests/MUTATIONS.md
 genvm-lint check contracts/telltale.py contracts/fixtures/piecework.py
 npm ci                                       # genlayer-js 2.0.0-rc.1 and viem 2.56.5, from the lockfile
 node tests/on_chain/smoke.mjs                # Studio Next, throwaway accounts funded from the faucet

@@ -108,6 +108,19 @@ The register answers a question; the budget obeys the answer. Keeping them apart
 register can be read by anything, and the whole settlement rule fits on one page. It also keeps
 the register free of value, so no judgement can move money by accident.
 
+## Why there is no transient error class
+
+The canonical GenLayer pattern separates a transient failure (the model was unreachable, agree
+if both nodes saw it) from a judge that misbehaved (never agree, rotate). This contract makes no
+web calls, and from inside the block a model that cannot be reached and a model that returns
+something unreadable arrive as the same exception. Guessing which one it was would put a
+tolerance where a value belongs, so both are classified as a judge failure and both rotate. A
+round that rotates stores nothing, and the page asks again.
+
+Measured on Studio Next on 16 September 2026: a real round came back
+`invalid nondeterministic response`, every validator disagreed, and nothing was stored. That is
+the behaviour this class is for.
+
 ## Measured on GenLayer Studio Next (chain 61997, consensus v0.6), 16 September 2026
 
 - The whole story runs: four subjects from three accounts, a second subject from an account
